@@ -1,0 +1,128 @@
+#!/Users/anurag/Downloads/work/bin/python
+
+from common import *
+from selenium import webdriver
+from bs4 import BeautifulSoup
+import argparse, os, time, ast, json
+from joblib import Memory
+from datetime import datetime
+import matplotlib.pyplot as plt
+import mplleaflet
+
+parser = argparse.ArgumentParser(description='')
+parser.add_argument('--clearCache', action='store_true', default=False)
+parser.add_argument('--printLocations', action='store_true', default=False)
+parser.add_argument('--plotMap', action='store_true', default=False)
+parser.add_argument('--printNameAddr', action='store_true', default=False)
+parser.add_argument('--prefix', type=str, default='test-logs/')
+args = parser.parse_args()
+
+memory = Memory(location='./ezcharge-cachedir', verbose=0)
+if args.clearCache: memory.clear()
+
+options = webdriver.ChromeOptions()
+options.add_argument('--ignore-certificate-errors')
+options.add_argument('--incognito')
+options.add_argument('--headless')
+
+def filter_ccs2(driver):
+    filter_button = driver.find_element_by_id('mapFilterButton')
+    filter_button.click()
+    time.sleep(2)
+    connectors = driver.find_elements_by_class_name('connector-label')
+    ccs2 = connectors[3]
+    ccs2.click()
+    time.sleep(2)
+
+    all_buttons = driver.find_elements_by_class_name('col-md-6')
+    for button in all_buttons:
+        if button.text == "Apply":
+            button.click()
+    time.sleep(2)
+
+@memory.cache
+def get_ccs2_stations():
+    driver = webdriver.Chrome(executable_path = '/Users/anurag/Downloads/charging-stations/chromedriver', options=options)
+    driver.get('https://ezcharge.tatapower.com/evselfcare/#/home')
+    time.sleep(5)
+    filter_ccs2(driver)
+    source = driver.page_source
+    driver.close()
+    return source
+
+if args.printLocations:
+    source = get_ccs2_stations()
+
+    soup = BeautifulSoup(source, 'html.parser')
+    div = soup.find('app-map-view')
+    stations = div.find('div', class_='d-none').get_text()
+    stations = stations.replace(']', '').replace('[', '').strip()
+    delim = '},'
+    stations = [st + delim[0] for st in stations.split(delim) if st[-1] != '}']
+    stations = [json.loads(station) for station in stations]
+
+    f = open(args.prefix + '/station-locations-%s' % (datetime.today().strftime('%Y-%m-%d')), 'w')
+    time = datetime.now()
+    f.write('%d-%d-%d-%d-%d\n' % (time.year, time.month, time.day, time.hour, time.minute))
+    f.write("Stations Total:%d\n" % (len(stations)))
+    for station in stations:
+        f.write("%s:%s,%s\n" % (station['stationCode'], station['latitude'], station['longitude']))
+    f.close()
+
+    if args.plotMap:
+        def longitude(stations): return [st['longitude'] for st in stations]
+        def latitude(stations): return [st['latitude'] for st in stations]
+
+        fig, ax = plt.subplots()
+        ax.plot(longitude(filter(available_filter, stations)), latitude(filter(available_filter, stations)), 'gs', label='Available')
+        ax.plot(longitude(filter(charging_filter, stations)), latitude(filter(charging_filter, stations)), 'ys', label='Charging')
+        ax.plot(longitude(filter(outoforder_filter, stations)), latitude(filter(outoforder_filter, stations)), 'rs', label='Not working')
+        mplleaflet.show(fig=fig)
+
+if args.printNameAddr:
+    @memory.cache
+    def get_charger_list():
+        driver = webdriver.Chrome(executable_path = '/Users/anurag/Downloads/charging-stations/chromedriver', options=options)
+        driver.get('https://ezcharge.tatapower.com/evselfcare/#/home')
+        time.sleep(2)
+        filter_ccs2(driver)
+        # Show nearby charging stations pop up
+        nearby_button = driver.find_element_by_class_name('hamburger.ng-star-inserted')
+        nearby_button.click()
+        time.sleep(2)
+
+        def parse_charger_list(source):
+            soup = BeautifulSoup(source, 'html.parser')
+            div = soup.find('div', class_='mx-1 nearby-stations-wrapper')
+            divs = div.findAll('div', class_='mt-3 ng-star-inserted carousel-border')
+            divs += div.findAll('div', class_='mt-3 ng-star-inserted') # Last station
+            return divs
+
+        # Keep scrolling down till the pop up lists all chargers
+        MAX_CHARGERS = 131
+        element = driver.find_element_by_class_name('nearby-stations-wrapper')
+        prev_chargers, epoch_count = 0, 0
+        while True:
+            driver.execute_script('arguments[0].scrollTop = arguments[0].scrollHeight', element)
+            time.sleep(0.25)
+            cur_chargers = len(parse_charger_list(driver.page_source))
+            if cur_chargers >= MAX_CHARGERS: break
+            if cur_chargers == prev_chargers:
+                epoch_count += 1
+                if epoch_count >= 20: break
+            else: epoch_count= 0
+        chargers = parse_charger_list(driver.page_source.encode('utf-8'))
+        driver.close()
+        return chargers
+
+    # We now have the final html generated by javascript. Parse it with soup
+    chargers = get_charger_list()
+
+    for charger in chargers:
+        name = charger.find('span', class_='title-name').get_text()
+        value = charger.find('div', class_='title-value').get_text()
+        print(name + " : " + value)
+        #divs = charger.findAll('div', class_="d-flex align-items-center justify-content-center mx-1 connector-name")
+        #divs = charger.findAll('div', class_='d-flex align-items-center text-center justify-content-center mx-1 connector-tariff')
+        #for div in divs:
+        #    print(div.get_text().encode('utf-8'))
